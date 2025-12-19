@@ -112,15 +112,16 @@ export async function POST(request: Request) {
         // 6. 检测 FP 碰撞：同一 FP 在 1 小时内出现 >= 3 个不同 IP
         const isFpCollision = fpRelatedIpCount >= FP_COLLISION_IP_THRESHOLD;
 
-        // 7. 根据是否碰撞选择限流策略
+        // 7. 判断是否限流
+        // - 碰撞情况：直接封禁该 FP（所有 IP 都不能用）
         // - 正常情况：使用 FP 作为主要限流维度
-        // - 碰撞情况：使用 FP+IP 组合限流（每个 IP 独立计数）
-        const effectiveUsage = isFpCollision ? currentCombinedUsage : currentFpUsage;
-        const isLimited = effectiveUsage >= DAILY_LIMIT;
-        const remaining = Math.max(0, DAILY_LIMIT - effectiveUsage);
+        const isLimitedByCollision = isFpCollision; // 碰撞即封禁
+        const isLimitedByUsage = currentFpUsage >= DAILY_LIMIT; // 正常限流
+        const isLimited = isLimitedByCollision || isLimitedByUsage;
+        const remaining = isLimitedByCollision ? 0 : Math.max(0, DAILY_LIMIT - currentFpUsage);
 
         // 8. 如果未超限，增加计数
-        let newUsageCount = effectiveUsage;
+        let newUsageCount = currentFpUsage;
         if (!isLimited) {
             const ttl = getSecondsUntilMidnight();
 
@@ -131,14 +132,14 @@ export async function POST(request: Request) {
                 redis.incr(combinedKey).then(() => redis.expire(combinedKey, ttl)),
             ]);
 
-            newUsageCount = effectiveUsage + 1;
+            newUsageCount = currentFpUsage + 1;
         }
 
         // 9. 构建限流原因说明
         let limitReason: string | null = null;
         if (isLimited) {
-            if (isFpCollision) {
-                limitReason = `检测到指纹碰撞（1小时内 ${fpRelatedIpCount} 个不同IP使用同一指纹），已切换到 IP+指纹 组合限流，当前 IP 今日额度已用完`;
+            if (isLimitedByCollision) {
+                limitReason = `检测到指纹异常（1小时内 ${fpRelatedIpCount} 个不同IP使用同一指纹，超过阈值 ${FP_COLLISION_IP_THRESHOLD}），该指纹已被临时封禁`;
             } else {
                 limitReason = `该设备指纹今日使用次数已达上限（${DAILY_LIMIT}次）`;
             }
@@ -164,9 +165,9 @@ export async function POST(request: Request) {
                 // FP 碰撞检测信息
                 collision: {
                     detected: isFpCollision,
+                    blocked: isLimitedByCollision, // 是否因碰撞被封禁
                     relatedIpCount: fpRelatedIpCount,
                     threshold: FP_COLLISION_IP_THRESHOLD,
-                    strategy: isFpCollision ? "combined" : "fingerprint",
                 },
 
                 // 多维度使用情况（调试用）
@@ -187,9 +188,7 @@ export async function POST(request: Request) {
             },
             message: isLimited
                 ? limitReason
-                : isFpCollision
-                    ? `检测到 FP 碰撞（${fpRelatedIpCount}个IP），已切换到组合限流。今日还剩 ${remaining - 1} 次`
-                    : `本次调用成功，今日还剩 ${remaining - 1} 次`,
+                : `本次调用成功，今日还剩 ${remaining - 1} 次`,
         };
 
         return Response.json(responseData, {
@@ -253,17 +252,20 @@ export async function GET(request: Request) {
 
         // 检测 FP 碰撞
         const isFpCollision = fpRelatedIpCount >= FP_COLLISION_IP_THRESHOLD;
-        const effectiveUsage = isFpCollision ? currentCombinedUsage : currentFpUsage;
-        const remaining = Math.max(0, DAILY_LIMIT - effectiveUsage);
 
-        // 判断限流状态和原因
-        const isLimited = effectiveUsage >= DAILY_LIMIT;
+        // 判断限流状态
+        // - 碰撞情况：直接封禁该 FP（所有 IP 都不能用）
+        // - 正常情况：使用 FP 作为主要限流维度
+        const isLimitedByCollision = isFpCollision; // 碰撞即封禁
+        const isLimitedByUsage = currentFpUsage >= DAILY_LIMIT;
+        const isLimited = isLimitedByCollision || isLimitedByUsage;
+        const remaining = isLimitedByCollision ? 0 : Math.max(0, DAILY_LIMIT - currentFpUsage);
 
         // 构建限流原因说明
         let limitReason: string | null = null;
         if (isLimited) {
-            if (isFpCollision) {
-                limitReason = `检测到指纹碰撞（1小时内 ${fpRelatedIpCount} 个不同IP使用同一指纹），已切换到 IP+指纹 组合限流，当前 IP 今日额度已用完`;
+            if (isLimitedByCollision) {
+                limitReason = `检测到指纹异常（1小时内 ${fpRelatedIpCount} 个不同IP使用同一指纹，超过阈值 ${FP_COLLISION_IP_THRESHOLD}），该指纹已被临时封禁`;
             } else {
                 limitReason = `该设备指纹今日使用次数已达上限（${DAILY_LIMIT}次）`;
             }
@@ -275,16 +277,16 @@ export async function GET(request: Request) {
                 visitorId,
                 clientIP,
                 dailyLimit: DAILY_LIMIT,
-                usedToday: effectiveUsage,
+                usedToday: currentFpUsage,
                 remaining,
                 isLimited,
                 // 限流原因（仅在被限流时返回）
                 limitReason,
                 collision: {
                     detected: isFpCollision,
+                    blocked: isLimitedByCollision, // 是否因碰撞被封禁
                     relatedIpCount: fpRelatedIpCount,
                     threshold: FP_COLLISION_IP_THRESHOLD,
-                    strategy: isFpCollision ? "combined" : "fingerprint",
                 },
                 usageDetails: {
                     byFingerprint: currentFpUsage,
@@ -295,9 +297,7 @@ export async function GET(request: Request) {
             },
             message: isLimited
                 ? limitReason
-                : isFpCollision
-                    ? `检测到 FP 碰撞，今日已使用 ${effectiveUsage}/${DAILY_LIMIT} 次（组合限流）`
-                    : `今日已使用 ${effectiveUsage}/${DAILY_LIMIT} 次`,
+                : `今日已使用 ${currentFpUsage}/${DAILY_LIMIT} 次`,
         });
     } catch (error) {
         console.error("Rate limit query error:", error);
