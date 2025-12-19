@@ -18,27 +18,6 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
-## Upstash (rate limit for /api/ai)
-
-This project includes a demo "AI" endpoint at `POST /api/ai` protected by Upstash Redis rate limiting.
-
-Create a local env file (do not commit it) named `.env.local` and set:
-
-- `UPSTASH_REDIS_REST_URL`
-- `UPSTASH_REDIS_REST_TOKEN`
-
-Example request (send visitorId from FingerprintJS):
-
-```bash
-curl -X POST http://localhost:3000/api/ai ^
-  -H "Content-Type: application/json" ^
-  -H "x-visitor-id: YOUR_VISITOR_ID" ^
-  -d "{\"prompt\":\"hello\"}"
-```
-
-The response contains `limit/remaining/reset` and also returns rate limit headers:
-`x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset`.
-
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
 ## Learn More

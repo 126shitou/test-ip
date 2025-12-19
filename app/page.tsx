@@ -1,175 +1,321 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import FingerprintJS from "@fingerprintjs/fingerprintjs";
 
-type AiResponse =
-  | {
-      ok: true;
-      answer: string;
-      prompt: string;
-      limit: number;
-      remaining: number;
-      reset: number;
-      visitorId: string | null;
-      identifier: string;
-    }
-  | {
-      ok: false;
-      error: string;
-      limit: number;
-      remaining: number;
-      reset: number;
-      retryAfterSeconds?: number;
-      visitorId: string | null;
-      identifier: string;
-    };
+type UsageData = {
+  visitorId: string;
+  clientIP: string;
+  userAgent?: string;
+  dailyLimit: number;
+  usedToday: number;
+  remaining: number;
+  isLimited: boolean;
+  usageDetails: {
+    byFingerprint: number;
+    byIP: number;
+    byCombined?: number;
+  };
+  date: string;
+  resetAt?: string;
+};
 
-function formatReset(resetMs: number) {
-  try {
-    return new Date(resetMs).toLocaleString();
-  } catch {
-    return String(resetMs);
-  }
-}
+type ApiResponse = {
+  success: boolean;
+  data: UsageData | null;
+  message: string;
+  error?: string;
+};
 
 export default function Home() {
   const [visitorId, setVisitorId] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState("你好，介绍一下你自己");
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<AiResponse | null>(null);
+  const [usageData, setUsageData] = useState<UsageData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [callHistory, setCallHistory] = useState<
+    { time: string; success: boolean; message: string }[]
+  >([]);
 
+  // 初始化 FingerprintJS
   useEffect(() => {
-    let cancelled = false;
     (async () => {
       try {
         const fp = await FingerprintJS.load();
-        const r = await fp.get();
-        if (cancelled) return;
-        setVisitorId(r.visitorId);
-      } catch (e) {
-        if (cancelled) return;
-        // Fingerprinting may fail due to CSP/adblock/etc. The API will fallback to IP.
-        setVisitorId(null);
-        console.warn("FingerprintJS failed:", e);
+        const result = await fp.get();
+        setVisitorId(result.visitorId);
+      } catch (err) {
+        console.warn("FingerprintJS failed:", err);
+        setError("无法获取浏览器指纹");
       }
     })();
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
-  const canCall = useMemo(() => !loading, [loading]);
+  // 查询当前使用情况
+  const fetchUsage = useCallback(async () => {
+    if (!visitorId) return;
 
-  async function callAi() {
+    try {
+      const res = await fetch(`/api/ai?visitorId=${visitorId}`);
+      const data: ApiResponse = await res.json();
+      if (data.success && data.data) {
+        setUsageData(data.data);
+        setError(null);
+      }
+    } catch (err) {
+      console.error("Failed to fetch usage:", err);
+    }
+  }, [visitorId]);
+
+  // 初始化时查询使用情况
+  useEffect(() => {
+    if (visitorId) {
+      fetchUsage();
+    }
+  }, [visitorId, fetchUsage]);
+
+  // 调用 API（消耗次数）
+  const callApi = async () => {
+    if (!visitorId || loading) return;
+
     setLoading(true);
     setError(null);
+
     try {
       const res = await fetch("/api/ai", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(visitorId ? { "x-visitor-id": visitorId } : {}),
-        },
-        body: JSON.stringify({ prompt, visitorId }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ visitorId }),
       });
 
-      const data = (await res.json()) as AiResponse;
-      setResult(data);
-      if (!res.ok) {
-        setError(
-          data.ok
-            ? "请求失败"
-            : data.error === "RATE_LIMITED"
-              ? `已限流，请稍后再试（${data.retryAfterSeconds ?? "?"}s）`
-              : `请求失败：${data.error}`,
-        );
+      const data: ApiResponse = await res.json();
+      const now = new Date().toLocaleTimeString("zh-CN");
+
+      if (data.data) {
+        setUsageData(data.data);
       }
-    } catch (e) {
-      setError(`网络错误：${e instanceof Error ? e.message : String(e)}`);
-      setResult(null);
+
+      setCallHistory((prev) => [
+        { time: now, success: data.success, message: data.message },
+        ...prev.slice(0, 9), // 只保留最近 10 条
+      ]);
+
+      if (!data.success) {
+        setError(data.message || data.error || "调用失败");
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "网络错误";
+      setError(msg);
+      setCallHistory((prev) => [
+        { time: new Date().toLocaleTimeString("zh-CN"), success: false, message: msg },
+        ...prev.slice(0, 9),
+      ]);
     } finally {
       setLoading(false);
     }
-  }
+  };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <div className="w-full max-w-2xl rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <div className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
-              AI 调用模拟（免登录 + 限次数）
-            </div>
-            <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              调用 <span className="font-mono">POST /api/ai</span>，服务端用 Upstash
-              Redis 按 visitorId/IP 做限流。
-            </div>
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-4 font-sans text-slate-100 sm:p-8">
+      <div className="mx-auto max-w-2xl">
+        {/* Header */}
+        <div className="mb-8 text-center">
+          <h1 className="mb-2 text-3xl font-bold tracking-tight text-white sm:text-4xl">
+            🔒 Rate Limit Demo
+          </h1>
+          <p className="text-slate-400">
+            FingerprintJS + Upstash Redis + IP 多维度限流演示
+          </p>
+        </div>
+
+        {/* 用户标识卡片 */}
+        <div className="mb-6 overflow-hidden rounded-2xl border border-slate-700/50 bg-slate-800/50 shadow-xl backdrop-blur">
+          <div className="border-b border-slate-700/50 bg-slate-800/80 px-5 py-3">
+            <h2 className="font-semibold text-slate-200">👤 用户标识</h2>
           </div>
-          <div className="text-right text-xs text-zinc-500 dark:text-zinc-400">
-            <div>visitorId</div>
-            <div className="mt-1 max-w-[240px] truncate font-mono text-zinc-800 dark:text-zinc-200">
-              {visitorId ?? "（获取中/不可用）"}
+          <div className="space-y-4 p-5">
+            <div>
+              <div className="mb-1 text-xs font-medium uppercase tracking-wider text-slate-500">
+                浏览器指纹 ID
+              </div>
+              <div className="break-all rounded-lg bg-slate-900/70 px-3 py-2 font-mono text-sm text-emerald-400">
+                {visitorId ?? (
+                  <span className="animate-pulse text-slate-500">获取中...</span>
+                )}
+              </div>
+            </div>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <div className="mb-1 text-xs font-medium uppercase tracking-wider text-slate-500">
+                  IP 地址
+                </div>
+                <div className="rounded-lg bg-slate-900/70 px-3 py-2 font-mono text-sm text-amber-400">
+                  {usageData?.clientIP ?? (
+                    <span className="text-slate-500">--</span>
+                  )}
+                </div>
+              </div>
+              <div>
+                <div className="mb-1 text-xs font-medium uppercase tracking-wider text-slate-500">
+                  日期
+                </div>
+                <div className="rounded-lg bg-slate-900/70 px-3 py-2 font-mono text-sm text-sky-400">
+                  {usageData?.date ?? (
+                    <span className="text-slate-500">--</span>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
-        <div className="mt-5">
-          <label className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
-            Prompt
-          </label>
-          <textarea
-            className="mt-2 w-full resize-none rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 outline-none ring-0 focus:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:focus:border-zinc-600"
-            rows={4}
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="输入你要问 AI 的内容"
-          />
+        {/* 使用情况卡片 */}
+        <div className="mb-6 overflow-hidden rounded-2xl border border-slate-700/50 bg-slate-800/50 shadow-xl backdrop-blur">
+          <div className="border-b border-slate-700/50 bg-slate-800/80 px-5 py-3">
+            <h2 className="font-semibold text-slate-200">📊 今日使用情况</h2>
+          </div>
+          <div className="p-5">
+            {/* 进度条 */}
+            <div className="mb-6">
+              <div className="mb-2 flex items-baseline justify-between">
+                <span className="text-sm text-slate-400">使用进度</span>
+                <span className="font-mono text-lg font-bold">
+                  <span
+                    className={
+                      usageData?.isLimited ? "text-red-400" : "text-emerald-400"
+                    }
+                  >
+                    {usageData?.usedToday ?? 0}
+                  </span>
+                  <span className="text-slate-500">
+                    {" "}
+                    / {usageData?.dailyLimit ?? 3}
+                  </span>
+                </span>
+              </div>
+              <div className="h-3 overflow-hidden rounded-full bg-slate-700">
+                <div
+                  className={`h-full transition-all duration-500 ${usageData?.isLimited
+                      ? "bg-gradient-to-r from-red-500 to-red-400"
+                      : "bg-gradient-to-r from-emerald-500 to-emerald-400"
+                    }`}
+                  style={{
+                    width: `${((usageData?.usedToday ?? 0) / (usageData?.dailyLimit ?? 3)) * 100}%`,
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* 统计数字 */}
+            <div className="grid grid-cols-3 gap-4 text-center">
+              <div className="rounded-xl bg-slate-900/50 p-4">
+                <div className="text-2xl font-bold text-emerald-400">
+                  {usageData?.remaining ?? 3}
+                </div>
+                <div className="mt-1 text-xs text-slate-500">剩余次数</div>
+              </div>
+              <div className="rounded-xl bg-slate-900/50 p-4">
+                <div className="text-2xl font-bold text-amber-400">
+                  {usageData?.usageDetails?.byIP ?? 0}
+                </div>
+                <div className="mt-1 text-xs text-slate-500">IP 调用</div>
+              </div>
+              <div className="rounded-xl bg-slate-900/50 p-4">
+                <div className="text-2xl font-bold text-sky-400">
+                  {usageData?.usageDetails?.byFingerprint ?? 0}
+                </div>
+                <div className="mt-1 text-xs text-slate-500">指纹调用</div>
+              </div>
+            </div>
+
+            {/* 状态标签 */}
+            {usageData?.isLimited && (
+              <div className="mt-4 flex items-center justify-center gap-2 rounded-lg bg-red-500/10 py-3 text-red-400">
+                <span className="text-lg">🚫</span>
+                <span className="font-medium">今日次数已用完</span>
+              </div>
+            )}
+          </div>
         </div>
 
-        <div className="mt-4 flex items-center gap-3">
+        {/* 操作按钮 */}
+        <div className="mb-6">
           <button
-            className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
-            disabled={!canCall}
-            onClick={callAi}
+            onClick={callApi}
+            disabled={loading || !visitorId}
+            className={`w-full rounded-xl px-6 py-4 text-lg font-semibold shadow-lg transition-all ${loading || !visitorId
+                ? "cursor-not-allowed bg-slate-700 text-slate-500"
+                : usageData?.isLimited
+                  ? "bg-gradient-to-r from-red-600 to-red-500 text-white hover:from-red-500 hover:to-red-400 hover:shadow-red-500/20"
+                  : "bg-gradient-to-r from-emerald-600 to-emerald-500 text-white hover:from-emerald-500 hover:to-emerald-400 hover:shadow-emerald-500/20"
+              }`}
           >
-            {loading ? "调用中…" : "调用 AI"}
-          </button>
-
-          {result && (
-            <div className="text-xs text-zinc-600 dark:text-zinc-400">
-              <span className="font-medium">remaining:</span>{" "}
-              <span className="font-mono">{result.remaining}</span> /{" "}
-              <span className="font-mono">{result.limit}</span>{" "}
-              <span className="ml-2">
-                <span className="font-medium">reset:</span>{" "}
-                <span className="font-mono">{formatReset(result.reset)}</span>
+            {loading ? (
+              <span className="flex items-center justify-center gap-2">
+                <svg className="h-5 w-5 animate-spin" viewBox="0 0 24 24">
+                  <circle
+                    className="opacity-25"
+                    cx="12"
+                    cy="12"
+                    r="10"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                    fill="none"
+                  />
+                  <path
+                    className="opacity-75"
+                    fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                  />
+                </svg>
+                调用中...
               </span>
-            </div>
-          )}
+            ) : usageData?.isLimited ? (
+              "🚫 已达上限（点击测试拒绝）"
+            ) : (
+              "🚀 调用 AI 接口（消耗 1 次）"
+            )}
+          </button>
         </div>
 
+        {/* 错误提示 */}
         {error && (
-          <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800 dark:border-rose-900/40 dark:bg-rose-950/40 dark:text-rose-200">
-            {error}
+          <div className="mb-6 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-red-400">
+            ⚠️ {error}
           </div>
         )}
 
-        {result?.ok && (
-          <div className="mt-4 rounded-md border border-zinc-200 bg-zinc-50 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/50">
-            <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
-              Answer
+        {/* 调用历史 */}
+        {callHistory.length > 0 && (
+          <div className="overflow-hidden rounded-2xl border border-slate-700/50 bg-slate-800/50 shadow-xl backdrop-blur">
+            <div className="border-b border-slate-700/50 bg-slate-800/80 px-5 py-3">
+              <h2 className="font-semibold text-slate-200">📜 调用历史</h2>
             </div>
-            <div className="mt-1 whitespace-pre-wrap text-sm text-zinc-900 dark:text-zinc-100">
-              {result.answer}
-            </div>
-            <div className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
-              <span className="font-medium">identifier:</span>{" "}
-              <span className="font-mono">{result.identifier}</span>
+            <div className="max-h-64 overflow-y-auto">
+              {callHistory.map((item, i) => (
+                <div
+                  key={i}
+                  className={`flex items-start gap-3 border-b border-slate-700/30 px-5 py-3 last:border-0 ${item.success ? "bg-slate-800/30" : "bg-red-500/5"
+                    }`}
+                >
+                  <span className="mt-0.5 text-lg">
+                    {item.success ? "✅" : "❌"}
+                  </span>
+                  <div className="flex-1">
+                    <div className="text-sm text-slate-300">{item.message}</div>
+                    <div className="mt-0.5 text-xs text-slate-500">
+                      {item.time}
+                    </div>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}
+
+        {/* Footer */}
+        <div className="mt-8 text-center text-xs text-slate-600">
+          重置时间：每日 00:00（当地时间）
+        </div>
       </div>
     </div>
   );
