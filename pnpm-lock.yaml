@@ -30,9 +30,6 @@ importers:
         specifier: 19.2.3
         version: 19.2.3(react@19.2.3)
     devDependencies:
-      '@cloudflare/workerd-windows-64':
-        specifier: ^1.20251213.0
-        version: 1.20251213.0
       '@tailwindcss/postcss':
         specifier: ^4
         version: 4.1.18
@@ -503,12 +500,6 @@ packages:
     peerDependenciesMeta:
       workerd:
         optional: true
-
-  '@cloudflare/workerd-windows-64@1.20251213.0':
-    resolution: {integrity: sha512-QBwfyZXTzI2JHLS7ZEuVVMC81PAQyNxPdcv9Dxd8wvV4QYF7B97h9pUtaBnqUdlBwL6e3O8QniYkOl8c7bEFJw==}
-    engines: {node: '>=16'}
-    cpu: [x64]
-    os: [win32]
 
   '@cspotcode/source-map-support@0.8.1':
     resolution: {integrity: sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==}
@@ -5035,8 +5026,6 @@ snapshots:
       unenv: 2.0.0-rc.24
     optionalDependencies:
       workerd: 1.20251217.0
-
-  '@cloudflare/workerd-windows-64@1.20251213.0': {}
 
   '@cspotcode/source-map-support@0.8.1':
     dependencies:
