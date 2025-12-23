@@ -7,12 +7,60 @@ const redis = new Redis({
     token: process.env.UPSTASH_REDIS_TOKEN!,
 });
 
+// Cloudflare Turnstile Secret Key（从环境变量获取）
+// 测试 secret: 1x0000000000000000000000000000000AA (总是通过)
+// 测试 secret: 2x0000000000000000000000000000000AA (总是失败)
+// 后端环境变量不需要 NEXT_PUBLIC_ 前缀
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || "1x0000000000000000000000000000000AA";
+
+// Turnstile 验证接口响应类型
+interface TurnstileVerifyResponse {
+    success: boolean;
+    "error-codes"?: string[];
+    challenge_ts?: string;
+    hostname?: string;
+    action?: string;
+    cdata?: string;
+}
+
+// 验证 Turnstile token
+async function verifyTurnstileToken(token: string, clientIP: string): Promise<{ success: boolean; error?: string }> {
+    try {
+        const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+                secret: TURNSTILE_SECRET_KEY,
+                response: token,
+                remoteip: clientIP,
+            }),
+        });
+
+        const data: TurnstileVerifyResponse = await response.json();
+
+        if (!data.success) {
+            const errorCodes = data["error-codes"]?.join(", ") || "unknown";
+            console.warn("Turnstile verification failed:", errorCodes);
+            return { success: false, error: `人机验证失败: ${errorCodes}` };
+        }
+
+        return { success: true };
+    } catch (error) {
+        console.error("Turnstile verification error:", error);
+        return { success: false, error: "人机验证服务异常" };
+    }
+}
+
 // 每日限制次数
 const DAILY_LIMIT = 3;
 
 // FP 碰撞检测阈值：1小时内出现多少个不同 IP 视为碰撞
 const FP_COLLISION_IP_THRESHOLD = 3;
-// FP-IP 关联记录的 TTL（1小时）
+// IP 碰撞检测阈值：1小时内出现多少个不同 FP 视为碰撞
+const IP_COLLISION_FP_THRESHOLD = 5;
+// FP-IP / IP-FP 关联记录的 TTL（1小时）
 const FP_IP_TTL_SECONDS = 60 * 60;
 
 // 获取今天的日期字符串（用于 Redis key）
@@ -65,6 +113,7 @@ export async function POST(request: Request) {
 
         // 1. 获取基本信息
         const visitorId = body.visitorId as string | undefined;
+        const turnstileToken = body.turnstileToken as string | undefined;
         const clientIP = getClientIP(headersList);
         const userAgent = headersList.get("user-agent") || "unknown";
         const todayKey = getTodayKey();
@@ -81,7 +130,31 @@ export async function POST(request: Request) {
             );
         }
 
-        // 3. 构建 Redis key
+        // 3. 验证 Turnstile token（人机验证）
+        if (!turnstileToken || typeof turnstileToken !== "string") {
+            return Response.json(
+                {
+                    success: false,
+                    error: "Missing Turnstile token - 请完成人机验证",
+                    data: null,
+                },
+                { status: 400 }
+            );
+        }
+
+        const turnstileResult = await verifyTurnstileToken(turnstileToken, clientIP);
+        if (!turnstileResult.success) {
+            return Response.json(
+                {
+                    success: false,
+                    error: turnstileResult.error || "人机验证失败",
+                    data: null,
+                },
+                { status: 403 }
+            );
+        }
+
+        // 4. 构建 Redis key
         // 单独对 visitorId 限流（主要维度）
         const fingerprintKey = `ratelimit:fp:${visitorId}:${todayKey}`;
         // 单独对 IP 限流
@@ -90,37 +163,52 @@ export async function POST(request: Request) {
         const combinedKey = `ratelimit:combined:${visitorId}:${clientIP}:${todayKey}`;
         // FP 关联的 IP 集合（用于碰撞检测，1小时窗口）
         const fpIpSetKey = `fp:ips:${visitorId}`;
+        // IP 关联的 FP 集合（用于碰撞检测，1小时窗口）
+        const ipFpSetKey = `ip:fps:${clientIP}`;
 
-        // 4. 记录 FP-IP 关联 & 获取当前 FP 关联的 IP 数量
-        // 先添加当前 IP 到集合，再获取集合大小
-        await redis.sadd(fpIpSetKey, clientIP);
-        await redis.expire(fpIpSetKey, FP_IP_TTL_SECONDS);
+        // 5. 记录 FP-IP 和 IP-FP 双向关联
+        // 先添加到集合，再获取集合大小
+        await Promise.all([
+            redis.sadd(fpIpSetKey, clientIP),
+            redis.sadd(ipFpSetKey, visitorId),
+        ]);
+        await Promise.all([
+            redis.expire(fpIpSetKey, FP_IP_TTL_SECONDS),
+            redis.expire(ipFpSetKey, FP_IP_TTL_SECONDS),
+        ]);
 
-        // 5. 获取当前使用次数 & FP 关联的 IP 数量
-        const [fpCount, ipCount, combinedCount, fpIpCount] = await Promise.all([
+        // 6. 获取当前使用次数 & 碰撞检测数据
+        const [fpCount, ipCount, combinedCount, fpIpCount, ipFpCount] = await Promise.all([
             redis.get<number>(fingerprintKey),
             redis.get<number>(ipKey),
             redis.get<number>(combinedKey),
             redis.scard(fpIpSetKey),
+            redis.scard(ipFpSetKey),
         ]);
 
         const currentFpUsage = fpCount || 0;
         const currentIpUsage = ipCount || 0;
         const currentCombinedUsage = combinedCount || 0;
         const fpRelatedIpCount = fpIpCount || 0;
+        const ipRelatedFpCount = ipFpCount || 0;
 
-        // 6. 检测 FP 碰撞：同一 FP 在 1 小时内出现 >= 3 个不同 IP
+        // 7. 碰撞检测
+        // 7.1 FP 碰撞：同一 FP 在 1 小时内出现 >= 3 个不同 IP
         const isFpCollision = fpRelatedIpCount >= FP_COLLISION_IP_THRESHOLD;
+        // 7.2 IP 碰撞：同一 IP 在 1 小时内出现 >= 5 个不同 FP
+        const isIpCollision = ipRelatedFpCount >= IP_COLLISION_FP_THRESHOLD;
 
-        // 7. 判断是否限流
-        // - 碰撞情况：直接封禁该 FP（所有 IP 都不能用）
+        // 8. 判断是否限流
+        // - FP 碰撞：直接封禁该 FP（所有 IP 都不能用）
+        // - IP 碰撞：直接封禁该 IP（所有 FP 都不能用）
         // - 正常情况：使用 FP 作为主要限流维度
-        const isLimitedByCollision = isFpCollision; // 碰撞即封禁
+        const isLimitedByFpCollision = isFpCollision; // FP 碰撞封禁
+        const isLimitedByIpCollision = isIpCollision; // IP 碰撞封禁
         const isLimitedByUsage = currentFpUsage >= DAILY_LIMIT; // 正常限流
-        const isLimited = isLimitedByCollision || isLimitedByUsage;
-        const remaining = isLimitedByCollision ? 0 : Math.max(0, DAILY_LIMIT - currentFpUsage);
+        const isLimited = isLimitedByFpCollision || isLimitedByIpCollision || isLimitedByUsage;
+        const remaining = (isLimitedByFpCollision || isLimitedByIpCollision) ? 0 : Math.max(0, DAILY_LIMIT - currentFpUsage);
 
-        // 8. 如果未超限，增加计数
+        // 9. 如果未超限，增加计数
         let newUsageCount = currentFpUsage;
         if (!isLimited) {
             const ttl = getSecondsUntilMidnight();
@@ -135,17 +223,19 @@ export async function POST(request: Request) {
             newUsageCount = currentFpUsage + 1;
         }
 
-        // 9. 构建限流原因说明
+        // 10. 构建限流原因说明
         let limitReason: string | null = null;
         if (isLimited) {
-            if (isLimitedByCollision) {
+            if (isLimitedByFpCollision) {
                 limitReason = `检测到指纹异常（1小时内 ${fpRelatedIpCount} 个不同IP使用同一指纹，超过阈值 ${FP_COLLISION_IP_THRESHOLD}），该指纹已被临时封禁`;
+            } else if (isLimitedByIpCollision) {
+                limitReason = `检测到IP异常（1小时内 ${ipRelatedFpCount} 个不同指纹使用同一IP，超过阈值 ${IP_COLLISION_FP_THRESHOLD}），该IP已被临时封禁`;
             } else {
                 limitReason = `该设备指纹今日使用次数已达上限（${DAILY_LIMIT}次）`;
             }
         }
 
-        // 10. 构建响应数据
+        // 11. 构建响应数据
         const responseData = {
             success: !isLimited,
             data: {
@@ -162,12 +252,22 @@ export async function POST(request: Request) {
                 // 限流原因（仅在被限流时返回）
                 limitReason,
 
-                // FP 碰撞检测信息
+                // 碰撞检测信息
                 collision: {
-                    detected: isFpCollision,
-                    blocked: isLimitedByCollision, // 是否因碰撞被封禁
-                    relatedIpCount: fpRelatedIpCount,
-                    threshold: FP_COLLISION_IP_THRESHOLD,
+                    // FP 碰撞：同一 FP 被多个 IP 使用
+                    fpCollision: {
+                        detected: isFpCollision,
+                        blocked: isLimitedByFpCollision,
+                        relatedIpCount: fpRelatedIpCount,
+                        threshold: FP_COLLISION_IP_THRESHOLD,
+                    },
+                    // IP 碰撞：同一 IP 被多个 FP 使用
+                    ipCollision: {
+                        detected: isIpCollision,
+                        blocked: isLimitedByIpCollision,
+                        relatedFpCount: ipRelatedFpCount,
+                        threshold: IP_COLLISION_FP_THRESHOLD,
+                    },
                 },
 
                 // 多维度使用情况（调试用）
@@ -238,34 +338,42 @@ export async function GET(request: Request) {
         const ipKey = `ratelimit:ip:${clientIP}:${todayKey}`;
         const combinedKey = `ratelimit:combined:${visitorId}:${clientIP}:${todayKey}`;
         const fpIpSetKey = `fp:ips:${visitorId}`;
+        const ipFpSetKey = `ip:fps:${clientIP}`;
 
-        const [fpCount, ipCount, combinedCount, fpIpCount] = await Promise.all([
+        const [fpCount, ipCount, combinedCount, fpIpCount, ipFpCount] = await Promise.all([
             redis.get<number>(fingerprintKey),
             redis.get<number>(ipKey),
             redis.get<number>(combinedKey),
             redis.scard(fpIpSetKey),
+            redis.scard(ipFpSetKey),
         ]);
 
         const currentFpUsage = fpCount || 0;
         const currentCombinedUsage = combinedCount || 0;
         const fpRelatedIpCount = fpIpCount || 0;
+        const ipRelatedFpCount = ipFpCount || 0;
 
-        // 检测 FP 碰撞
+        // 碰撞检测
         const isFpCollision = fpRelatedIpCount >= FP_COLLISION_IP_THRESHOLD;
+        const isIpCollision = ipRelatedFpCount >= IP_COLLISION_FP_THRESHOLD;
 
         // 判断限流状态
-        // - 碰撞情况：直接封禁该 FP（所有 IP 都不能用）
+        // - FP 碰撞：直接封禁该 FP（所有 IP 都不能用）
+        // - IP 碰撞：直接封禁该 IP（所有 FP 都不能用）
         // - 正常情况：使用 FP 作为主要限流维度
-        const isLimitedByCollision = isFpCollision; // 碰撞即封禁
+        const isLimitedByFpCollision = isFpCollision;
+        const isLimitedByIpCollision = isIpCollision;
         const isLimitedByUsage = currentFpUsage >= DAILY_LIMIT;
-        const isLimited = isLimitedByCollision || isLimitedByUsage;
-        const remaining = isLimitedByCollision ? 0 : Math.max(0, DAILY_LIMIT - currentFpUsage);
+        const isLimited = isLimitedByFpCollision || isLimitedByIpCollision || isLimitedByUsage;
+        const remaining = (isLimitedByFpCollision || isLimitedByIpCollision) ? 0 : Math.max(0, DAILY_LIMIT - currentFpUsage);
 
         // 构建限流原因说明
         let limitReason: string | null = null;
         if (isLimited) {
-            if (isLimitedByCollision) {
+            if (isLimitedByFpCollision) {
                 limitReason = `检测到指纹异常（1小时内 ${fpRelatedIpCount} 个不同IP使用同一指纹，超过阈值 ${FP_COLLISION_IP_THRESHOLD}），该指纹已被临时封禁`;
+            } else if (isLimitedByIpCollision) {
+                limitReason = `检测到IP异常（1小时内 ${ipRelatedFpCount} 个不同指纹使用同一IP，超过阈值 ${IP_COLLISION_FP_THRESHOLD}），该IP已被临时封禁`;
             } else {
                 limitReason = `该设备指纹今日使用次数已达上限（${DAILY_LIMIT}次）`;
             }
@@ -283,10 +391,20 @@ export async function GET(request: Request) {
                 // 限流原因（仅在被限流时返回）
                 limitReason,
                 collision: {
-                    detected: isFpCollision,
-                    blocked: isLimitedByCollision, // 是否因碰撞被封禁
-                    relatedIpCount: fpRelatedIpCount,
-                    threshold: FP_COLLISION_IP_THRESHOLD,
+                    // FP 碰撞：同一 FP 被多个 IP 使用
+                    fpCollision: {
+                        detected: isFpCollision,
+                        blocked: isLimitedByFpCollision,
+                        relatedIpCount: fpRelatedIpCount,
+                        threshold: FP_COLLISION_IP_THRESHOLD,
+                    },
+                    // IP 碰撞：同一 IP 被多个 FP 使用
+                    ipCollision: {
+                        detected: isIpCollision,
+                        blocked: isLimitedByIpCollision,
+                        relatedFpCount: ipRelatedFpCount,
+                        threshold: IP_COLLISION_FP_THRESHOLD,
+                    },
                 },
                 usageDetails: {
                     byFingerprint: currentFpUsage,

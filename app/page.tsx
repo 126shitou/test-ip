@@ -2,6 +2,11 @@
 
 import { useEffect, useState, useCallback } from "react";
 import FingerprintJS from "@fingerprintjs/fingerprintjs";
+import Turnstile from "./components/Turnstile";
+
+// Turnstile Site Key（从环境变量获取或使用测试 key）
+// 测试 Site Key: 1x00000000000000000000AA (总是通过)
+const TURNSTILE_SITE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || "1x00000000000000000000AA";
 
 type UsageData = {
   visitorId: string;
@@ -35,6 +40,12 @@ export default function Home() {
   const [callHistory, setCallHistory] = useState<
     { time: string; success: boolean; message: string }[]
   >([]);
+
+  // Turnstile 相关状态
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const [turnstileError, setTurnstileError] = useState<string | null>(null);
+  // 用于强制重新渲染 Turnstile 组件（每次调用后需要重新验证）
+  const [turnstileKey, setTurnstileKey] = useState(0);
 
   // 初始化 FingerprintJS
   useEffect(() => {
@@ -73,9 +84,31 @@ export default function Home() {
     }
   }, [visitorId, fetchUsage]);
 
+  // Turnstile 回调处理
+  const handleTurnstileSuccess = useCallback((token: string) => {
+    setTurnstileToken(token);
+    setTurnstileError(null);
+  }, []);
+
+  const handleTurnstileError = useCallback((errorCode: string) => {
+    setTurnstileToken(null);
+    setTurnstileError(`验证失败: ${errorCode}`);
+  }, []);
+
+  const handleTurnstileExpired = useCallback(() => {
+    setTurnstileToken(null);
+    setTurnstileError("验证已过期，请重新验证");
+  }, []);
+
   // 调用 API（消耗次数）
   const callApi = async () => {
     if (!visitorId || loading) return;
+
+    // 检查 Turnstile 验证
+    if (!turnstileToken) {
+      setError("请先完成人机验证");
+      return;
+    }
 
     setLoading(true);
     setError(null);
@@ -84,7 +117,10 @@ export default function Home() {
       const res = await fetch("/api/ai", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ visitorId }),
+        body: JSON.stringify({
+          visitorId,
+          turnstileToken, // 发送 Turnstile token 到后端验证
+        }),
       });
 
       const data: ApiResponse = await res.json();
@@ -102,6 +138,10 @@ export default function Home() {
       if (!data.success) {
         setError(data.message || data.error || "调用失败");
       }
+
+      // 每次调用后重置 Turnstile（token 只能用一次）
+      setTurnstileToken(null);
+      setTurnstileKey(k => k + 1);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "网络错误";
       setError(msg);
@@ -109,6 +149,9 @@ export default function Home() {
         { time: new Date().toLocaleTimeString("zh-CN"), success: false, message: msg },
         ...prev.slice(0, 9),
       ]);
+      // 出错也要重置 Turnstile
+      setTurnstileToken(null);
+      setTurnstileKey(k => k + 1);
     } finally {
       setLoading(false);
     }
@@ -195,8 +238,8 @@ export default function Home() {
               <div className="h-3 overflow-hidden rounded-full bg-slate-700">
                 <div
                   className={`h-full transition-all duration-500 ${usageData?.isLimited
-                      ? "bg-gradient-to-r from-red-500 to-red-400"
-                      : "bg-gradient-to-r from-emerald-500 to-emerald-400"
+                    ? "bg-gradient-to-r from-red-500 to-red-400"
+                    : "bg-gradient-to-r from-emerald-500 to-emerald-400"
                     }`}
                   style={{
                     width: `${((usageData?.usedToday ?? 0) / (usageData?.dailyLimit ?? 3)) * 100}%`,
@@ -237,16 +280,48 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Turnstile 人机验证 */}
+        <div className="mb-6 overflow-hidden rounded-2xl border border-slate-700/50 bg-slate-800/50 shadow-xl backdrop-blur">
+          <div className="border-b border-slate-700/50 bg-slate-800/80 px-5 py-3">
+            <h2 className="font-semibold text-slate-200">🛡️ 人机验证</h2>
+          </div>
+          <div className="flex flex-col items-center gap-3 p-5">
+            <Turnstile
+              key={turnstileKey}
+              siteKey={TURNSTILE_SITE_KEY}
+              onSuccess={handleTurnstileSuccess}
+              onError={handleTurnstileError}
+              onExpired={handleTurnstileExpired}
+              theme="dark"
+              size="normal"
+              action="ai-call"
+            />
+            {/* 验证状态 */}
+            {turnstileToken && (
+              <div className="flex items-center gap-2 rounded-lg bg-emerald-500/10 px-4 py-2 text-emerald-400">
+                <span>✓</span>
+                <span className="text-sm">验证通过</span>
+              </div>
+            )}
+            {turnstileError && (
+              <div className="flex items-center gap-2 rounded-lg bg-red-500/10 px-4 py-2 text-red-400">
+                <span>✗</span>
+                <span className="text-sm">{turnstileError}</span>
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* 操作按钮 */}
         <div className="mb-6">
           <button
             onClick={callApi}
-            disabled={loading || !visitorId}
-            className={`w-full rounded-xl px-6 py-4 text-lg font-semibold shadow-lg transition-all ${loading || !visitorId
-                ? "cursor-not-allowed bg-slate-700 text-slate-500"
-                : usageData?.isLimited
-                  ? "bg-gradient-to-r from-red-600 to-red-500 text-white hover:from-red-500 hover:to-red-400 hover:shadow-red-500/20"
-                  : "bg-gradient-to-r from-emerald-600 to-emerald-500 text-white hover:from-emerald-500 hover:to-emerald-400 hover:shadow-emerald-500/20"
+            disabled={loading || !visitorId || !turnstileToken}
+            className={`w-full rounded-xl px-6 py-4 text-lg font-semibold shadow-lg transition-all ${loading || !visitorId || !turnstileToken
+              ? "cursor-not-allowed bg-slate-700 text-slate-500"
+              : usageData?.isLimited
+                ? "bg-gradient-to-r from-red-600 to-red-500 text-white hover:from-red-500 hover:to-red-400 hover:shadow-red-500/20"
+                : "bg-gradient-to-r from-emerald-600 to-emerald-500 text-white hover:from-emerald-500 hover:to-emerald-400 hover:shadow-emerald-500/20"
               }`}
           >
             {loading ? (
@@ -269,6 +344,8 @@ export default function Home() {
                 </svg>
                 调用中...
               </span>
+            ) : !turnstileToken ? (
+              "🔒 请先完成人机验证"
             ) : usageData?.isLimited ? (
               "🚫 已达上限（点击测试拒绝）"
             ) : (
